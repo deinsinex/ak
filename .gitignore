@@ -1,6 +1,15 @@
 __pycache__/
 *.pyc
 *.pkl
+
 logs/
 datasets/
 *.tar.xz
+
+*.pem
+
+federation/global_model.json
+federation/local_model.json
+federation/local_model_version.txt
+
+intel/threat_reputation.json
