@@ -13,6 +13,8 @@ from core.risk_engine import RiskEngine
 from core.baseline_engine import BaselineEngine
 from core.protocol_analyzer import ProtocolAnalyzer
 from core.attack_sequence_engine import AttackSequenceEngine
+from core.traffic_monitor import TrafficMonitor
+from core.trust_engine import TrustEngine
 
 from ml.feature_extractor import FeatureExtractor
 from ml.ml_detector import MLDetector
@@ -50,6 +52,10 @@ risk_engine = RiskEngine()
 baseline_engine = BaselineEngine()
 
 sequence_engine = AttackSequenceEngine()
+
+traffic_monitor = TrafficMonitor()
+
+trust_engine = TrustEngine()
 
 
 # =============================
@@ -94,7 +100,11 @@ def respond_to_threat(ip):
 
     decision = risk_engine.decision(ip)
 
-    if decision == "BLOCK":
+    trust = trust_engine.get(ip)
+
+    print(f"[TRUST] {ip} → {trust}")
+
+    if decision == "BLOCK" and trust < 20:
 
         duration = threat_db.get_ban_duration(ip)
 
@@ -112,10 +122,12 @@ def respond_to_threat(ip):
 
 
 # =============================
-# RECORD EVENTS
+# EVENT REGISTRATION
 # =============================
 
 def register_event(ip, event_name, weight):
+
+    trust_engine.decrease(ip, 10)
 
     sequence_engine.record_event(ip, event_name)
 
@@ -141,18 +153,22 @@ def detection_engine(event):
     ip = event.source_ip
     packet = event.raw_packet
 
+    # -------------------------
+    # traffic monitor
+    # -------------------------
+
+    traffic_monitor.record_packet()
 
     # -------------------------
-    # Protocol analysis
+    # protocol analysis
     # -------------------------
 
     proto = protocol_analyzer.analyze(packet)
 
     print(f"[PROTO] {ip} → {proto['protocol']}:{proto['port']}")
 
-
     # -------------------------
-    # Baseline analysis
+    # baseline behavior
     # -------------------------
 
     baseline_state = baseline_engine.update(ip)
@@ -163,9 +179,12 @@ def detection_engine(event):
 
         register_event(ip, "BASELINE_ANOMALY", 30)
 
+    elif baseline_state == "ELEVATED":
+
+        register_event(ip, "BASELINE_ELEVATED", 10)
 
     # -------------------------
-    # Known attacker
+    # known attacker check
     # -------------------------
 
     if threat_memory.is_known_attacker(ip):
@@ -177,7 +196,6 @@ def detection_engine(event):
         block_engine.block_ip(ip, 600)
 
         return
-
 
     # -------------------------
     # TCP stealth scan
@@ -195,9 +213,8 @@ def detection_engine(event):
 
         return
 
-
     # -------------------------
-    # Port scan
+    # port scan detection
     # -------------------------
 
     if scan_detector.analyze(event):
@@ -210,9 +227,8 @@ def detection_engine(event):
 
         return
 
-
     # -------------------------
-    # Payload attack
+    # payload attack detection
     # -------------------------
 
     if payload_inspector.inspect(event.payload):
@@ -224,7 +240,6 @@ def detection_engine(event):
         register_event(ip, "PAYLOAD_ATTACK", 60)
 
         return
-
 
     # -------------------------
     # ML detection
@@ -245,6 +260,13 @@ def detection_engine(event):
 
         print("Probability:", probability)
 
+        if "reason" in result:
+
+            print("Reason:")
+
+            for k, v in result["reason"].items():
+                print(f"{k} → {v}")
+
         telemetry.log("ML_ATTACK_DETECTED", ip, probability)
 
         threat_memory.record_attack(ip, "ML_ATTACK")
@@ -253,10 +275,11 @@ def detection_engine(event):
 
         return
 
+    # -------------------------
+    # normal traffic
+    # -------------------------
 
-    # -------------------------
-    # Safe traffic
-    # -------------------------
+    trust_engine.increase(ip, 1)
 
     print(f"[SAFE] {ip} → {event.destination_ip}")
 
