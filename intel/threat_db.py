@@ -1,4 +1,4 @@
-kkimport time
+import time
 
 
 class ThreatDB:
