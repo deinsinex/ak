@@ -11,138 +11,72 @@ HTML = """
 <html>
 <head>
 
-<title>Aegis 3D Cyber Attack Globe</title>
+<title>Aegis Cyber Globe</title>
 
 <style>
-body{
-margin:0;
+body {
 background:black;
+margin:0;
 overflow:hidden;
-color:#00ff9c;
-font-family:monospace;
 }
 
-#title{
+canvas {
+display:block;
+}
+
+#title {
 position:absolute;
 top:10px;
 left:20px;
-font-size:22px;
+color:#00ff9c;
+font-family:monospace;
+font-size:24px;
 }
-
 </style>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://unpkg.com/three@0.150.1/build/three.min.js"></script>
+<script src="https://unpkg.com/three-globe"></script>
 
 </head>
 
 <body>
 
-<div id="title">🛡️ Aegis AI Firewall — Global Attack Monitor</div>
+<div id="title">🌍 Aegis Cyber Attack Globe</div>
 
 <script>
 
-let scene = new THREE.Scene();
+fetch('/data')
+.then(r=>r.json())
+.then(attacks=>{
 
-let camera = new THREE.PerspectiveCamera(
-75,
-window.innerWidth/window.innerHeight,
-0.1,
-1000
-);
+const Globe = new ThreeGlobe()
+.globeImageUrl('https://unpkg.com/three-globe/example/img/earth-dark.jpg')
+.arcsData(attacks)
+.arcColor(()=> '#ff0000')
+.arcAltitude(0.2)
+.arcStroke(0.5)
 
-let renderer = new THREE.WebGLRenderer();
-
+const renderer = new THREE.WebGLRenderer();
 renderer.setSize(window.innerWidth, window.innerHeight);
-
 document.body.appendChild(renderer.domElement);
 
+const scene = new THREE.Scene();
+scene.add(Globe);
 
-let geometry = new THREE.SphereGeometry(5, 64, 64);
+const camera = new THREE.PerspectiveCamera();
+camera.aspect = window.innerWidth/window.innerHeight;
+camera.updateProjectionMatrix();
+camera.position.z = 300;
 
-let material = new THREE.MeshBasicMaterial({
-color:0x0077ff,
-wireframe:true
+const animate = ()=>{
+requestAnimationFrame(animate);
+Globe.rotation.y += 0.001;
+renderer.render(scene,camera);
+};
+
+animate();
+
 });
-
-let globe = new THREE.Mesh(geometry, material);
-
-scene.add(globe);
-
-camera.position.z = 12;
-
-
-function latLonToVector3(lat, lon, radius){
-
-const phi = (90-lat)*(Math.PI/180)
-const theta = (lon+180)*(Math.PI/180)
-
-return new THREE.Vector3(
--(radius*Math.sin(phi)*Math.cos(theta)),
-(radius*Math.cos(phi)),
-(radius*Math.sin(phi)*Math.sin(theta))
-)
-
-}
-
-
-function createAttackArc(srcLat,srcLon,dstLat,dstLon){
-
-let start = latLonToVector3(srcLat,srcLon,5)
-let end = latLonToVector3(dstLat,dstLon,5)
-
-let material = new THREE.LineBasicMaterial({color:0xff0000})
-
-let points = []
-
-points.push(start)
-points.push(end)
-
-let geometry = new THREE.BufferGeometry().setFromPoints(points)
-
-let line = new THREE.Line(geometry,material)
-
-scene.add(line)
-
-setTimeout(()=>scene.remove(line),3000)
-
-}
-
-
-function fetchAttacks(){
-
-fetch("/attacks")
-.then(res=>res.json())
-.then(data=>{
-
-data.forEach(a=>{
-
-createAttackArc(
-a.lat,
-a.lon,
-20,
-0
-)
-
-})
-
-})
-
-}
-
-setInterval(fetchAttacks,2000)
-
-
-function animate(){
-
-requestAnimationFrame(animate)
-
-globe.rotation.y += 0.002
-
-renderer.render(scene,camera)
-
-}
-
-animate()
 
 </script>
 
@@ -151,22 +85,16 @@ animate()
 """
 
 
-@app.route("/")
-def index():
-    return render_template_string(HTML)
-
-
-@app.route("/attacks")
-def attacks():
+def read_attacks():
 
     if not os.path.exists(LOG_FILE):
         return []
 
-    results = []
+    arcs = []
 
     with open(LOG_FILE) as f:
 
-        for line in f.readlines()[-10:]:
+        for line in f.readlines()[-100:]:
 
             try:
 
@@ -177,24 +105,42 @@ def attacks():
                 if not geo:
                     continue
 
-                results.append({
-                    "lat": geo.get("lat"),
-                    "lon": geo.get("lon")
+                lat = geo.get("lat")
+                lon = geo.get("lon")
+
+                if lat is None or lon is None:
+                    continue
+
+                arcs.append({
+
+                    "startLat": lat,
+                    "startLng": lon,
+                    "endLat": 20,
+                    "endLng": 78
+
                 })
 
             except:
                 pass
 
-    return results
+    return arcs
 
 
-def start_soc_globe():
+@app.route("/")
+def home():
+    return render_template_string(HTML)
 
-    print("🌎 SOC 3D Globe running on port 7100")
+
+@app.route("/data")
+def data():
+    return read_attacks()
+
+
+if __name__ == "__main__":
+
+    print("🌍 Cyber Attack Globe running on port 7100")
 
     app.run(
         host="0.0.0.0",
-        port=7100,
-        debug=False,
-        use_reloader=False
+        port=7100
     )

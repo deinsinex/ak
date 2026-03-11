@@ -1,52 +1,49 @@
 import requests
 import urllib3
 
-from federation.crypto_utils import hash_weights, add_dp_noise
+from federation.crypto_utils import (
+    add_dp_noise,
+    generate_mask,
+    apply_mask,
+    hash_weights
+)
 
-
-# Disable SSL warnings for local testing
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 
 SERVER_URL = "https://localhost:8000/upload_weights"
 
 
 def send_weights(weights: dict):
-    """
-    Send differentially private weights to the federation server.
-
-    Raw model weights NEVER leave the edge device.
-    """
-
-    if not weights:
-        print("No weights to send.")
-        return
 
     try:
 
-        # Apply Differential Privacy
+        # differential privacy
         noisy_weights = add_dp_noise(weights)
 
-        # Hash noisy weights for integrity verification
-        weight_hash = hash_weights(noisy_weights)
+        # secure mask
+        mask = generate_mask(noisy_weights)
+
+        masked_weights = apply_mask(noisy_weights, mask)
+
+        weight_hash = hash_weights(masked_weights)
 
         payload = {
-            "weights": noisy_weights,
+
+            "weights": masked_weights,
+
             "hash": weight_hash
         }
 
         response = requests.post(
             SERVER_URL,
             json=payload,
-            verify=False,   # only for local testing
+            verify=False,
             timeout=10
         )
 
-        print("\nFederation server response:")
-        print(response.status_code)
+        print("\nSecure federated update sent")
 
-        if response.status_code != 200:
-            print("Server returned error.")
+        print("Server response:", response.status_code)
 
         try:
             print(response.json())

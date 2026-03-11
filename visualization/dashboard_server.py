@@ -1,59 +1,60 @@
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string
 import json
 import os
 import time
 
-from visualization.attack_map import build_attack_map
-from visualization.attack_simulator import (
-    run_port_scan,
-    run_stealth_scan,
-    run_payload_attack,
-    run_multi_stage_attack
-)
-
 from core.traffic_monitor import TrafficMonitor
-
 
 app = Flask(__name__)
 
-traffic_monitor = TrafficMonitor()
-
 LOG_FILE = "logs/attacks.json"
+
+monitor = TrafficMonitor()
 
 
 HTML = """
 <!DOCTYPE html>
 <html>
+
 <head>
 
-<title>Aegis AI Firewall Dashboard</title>
+<title>Aegis AI Firewall SOC</title>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<meta http-equiv="refresh" content="5">
 
 <style>
 
 body{
-background:black;
+background:#0d1117;
 color:#00ff9c;
 font-family:monospace;
 text-align:center;
 }
 
-button{
-padding:10px;
-margin:10px;
-background:#111;
-color:#00ff9c;
-border:1px solid #00ff9c;
+.container{
+width:90%;
+margin:auto;
 }
 
-canvas{
-background:#111;
+.card{
+background:#161b22;
+padding:20px;
+margin:10px;
+border-radius:10px;
+}
+
+.grid{
+display:grid;
+grid-template-columns:repeat(3,1fr);
+gap:10px;
+}
+
+h1{
 margin-top:20px;
 }
 
 iframe{
-width:90%;
+width:100%;
 height:400px;
 border:none;
 }
@@ -64,130 +65,113 @@ border:none;
 
 <body>
 
-<h1>🛡️ Aegis AI Firewall Control Center</h1>
+<h1>🛡️ Aegis AI Firewall SOC</h1>
 
-<h2>Attack Simulator</h2>
+<div class="container">
 
-<form method="POST">
-<button name="attack" value="scan">Run Port Scan</button>
-<button name="attack" value="stealth">Run Stealth Scan</button>
-<button name="attack" value="payload">Run Payload Attack</button>
-<button name="attack" value="multi">Run Multi Stage Attack</button>
-</form>
+<div class="grid">
 
+<div class="card">
+<h2>Packets/sec</h2>
+<h3>{{pps}}</h3>
+</div>
+
+<div class="card">
+<h2>Total Packets</h2>
+<h3>{{packets}}</h3>
+</div>
+
+<div class="card">
+<h2>Attack Events</h2>
+<h3>{{attacks}}</h3>
+</div>
+
+<div class="card">
+<h2>Active IPs</h2>
+<h3>{{ips}}</h3>
+</div>
+
+</div>
+
+<div class="card">
 <h2>Live Attack Map</h2>
-
 <iframe src="/map"></iframe>
+</div>
 
-<h2>Network Traffic</h2>
+<div class="card">
+<h2>Recent Alerts</h2>
+<pre>{{alerts}}</pre>
+</div>
 
-<canvas id="trafficChart" width="800" height="200"></canvas>
-
-<h2>Recent Attacks</h2>
-
-<pre>{{logs}}</pre>
-
-<script>
-
-const ctx = document.getElementById('trafficChart');
-
-const chart = new Chart(ctx, {
-type: 'line',
-data: {
-labels: [],
-datasets: [{
-label: 'Packets/sec',
-data: [],
-borderColor: '#00ff9c',
-fill: false
-}]
-},
-options: {
-scales: {
-y: {beginAtZero: true}
-}
-}
-});
-
-function updateTraffic(){
-
-fetch('/traffic')
-.then(res => res.json())
-.then(data => {
-
-chart.data.labels.push(new Date().toLocaleTimeString());
-chart.data.datasets[0].data.push(data.rate);
-
-if(chart.data.labels.length > 20){
-chart.data.labels.shift();
-chart.data.datasets[0].data.shift();
-}
-
-chart.update();
-
-});
-}
-
-setInterval(updateTraffic, 1000);
-
-</script>
+</div>
 
 </body>
+
 </html>
 """
 
 
-@app.route("/", methods=["GET","POST"])
-def dashboard():
+def read_alerts():
 
-    if request.method == "POST":
+    if not os.path.exists(LOG_FILE):
+        return "No alerts yet."
 
-        attack = request.form.get("attack")
+    lines = []
 
-        if attack == "scan":
-            run_port_scan()
+    with open(LOG_FILE) as f:
 
-        elif attack == "stealth":
-            run_stealth_scan()
+        for line in f.readlines()[-10:]:
 
-        elif attack == "payload":
-            run_payload_attack()
+            try:
 
-        elif attack == "multi":
-            run_multi_stage_attack()
+                entry = json.loads(line)
 
-    logs = ""
+                lines.append(
+                    f"{entry['timestamp']}  {entry['ip']}  {entry['event']}"
+                )
 
-    if os.path.exists(LOG_FILE):
+            except:
+                pass
 
-        with open(LOG_FILE) as f:
+    return "\n".join(lines)
 
-            lines = f.readlines()
 
-            logs = "".join(lines[-10:])
+@app.route("/")
+def home():
 
-    return render_template_string(HTML, logs=logs)
+    stats = monitor.stats()
+
+    alerts = read_alerts()
+
+    return render_template_string(
+
+        HTML,
+
+        pps=stats["packets_per_sec"],
+
+        packets=stats["total_packets"],
+
+        attacks=stats["attack_events"],
+
+        ips=stats["active_ips"],
+
+        alerts=alerts
+    )
 
 
 @app.route("/map")
 def map_view():
+
+    from visualization.attack_map import build_attack_map
 
     world_map = build_attack_map()
 
     return world_map._repr_html_()
 
 
-@app.route("/traffic")
-def traffic():
-
-    return jsonify({
-        "rate": traffic_monitor.get_rate()
-    })
-
-
 def start_attack_dashboard():
 
-    print("🌍 Dashboard running on port 7000")
+    print("🌍 SOC Dashboard running on port 7000")
 
     app.run(
         host="0.0.0.0",

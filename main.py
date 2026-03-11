@@ -13,10 +13,14 @@ from core.risk_engine import RiskEngine
 from core.baseline_engine import BaselineEngine
 from core.protocol_analyzer import ProtocolAnalyzer
 from core.attack_sequence_engine import AttackSequenceEngine
+from core.flow_analyzer import FlowAnalyzer
+from core.threat_intel_engine import ThreatIntelEngine
 from core.traffic_monitor import TrafficMonitor
 from core.trust_engine import TrustEngine
+from core.collaborative_intel import CollaborativeIntel
+from core.threat_share import share_threat
+from core.firewall_control import FirewallControl
 
-from ml.feature_extractor import FeatureExtractor
 from ml.ml_detector import MLDetector
 
 from federation.update_client import fetch_global_model
@@ -29,18 +33,14 @@ import time
 print("\n🛡️ Aegis AI Firewall Starting...\n")
 
 
-# =============================
-# INITIALIZE ENGINES
-# =============================
-
 payload_inspector = PayloadInspector()
 scan_detector = ScanDetector()
 tcp_analyzer = TCPFlagAnalyzer()
 
-feature_extractor = FeatureExtractor()
-ml_detector = MLDetector()
-
 protocol_analyzer = ProtocolAnalyzer()
+
+flow_analyzer = FlowAnalyzer()
+ml_detector = MLDetector()
 
 block_engine = BlockEngine()
 threat_db = ThreatDB()
@@ -53,14 +53,16 @@ baseline_engine = BaselineEngine()
 
 sequence_engine = AttackSequenceEngine()
 
+threat_intel = ThreatIntelEngine()
+
 traffic_monitor = TrafficMonitor()
 
 trust_engine = TrustEngine()
 
+collab_intel = CollaborativeIntel()
 
-# =============================
-# START DASHBOARD
-# =============================
+firewall_control = FirewallControl()
+
 
 threading.Thread(
     target=start_attack_dashboard,
@@ -68,15 +70,9 @@ threading.Thread(
 ).start()
 
 
-# =============================
-# FEDERATED MODEL UPDATER
-# =============================
-
 def model_update_loop():
 
     while True:
-
-        print("Checking for global model update...")
 
         try:
             fetch_global_model()
@@ -92,200 +88,103 @@ threading.Thread(
 ).start()
 
 
-# =============================
-# RESPONSE ENGINE
-# =============================
+def respond_to_threat(ip, reason):
 
-def respond_to_threat(ip):
+    duration = threat_db.get_ban_duration(ip)
 
-    decision = risk_engine.decision(ip)
+    telemetry.log("BLOCKED_ATTACKER", ip, reason)
 
-    trust = trust_engine.get(ip)
-
-    print(f"[TRUST] {ip} → {trust}")
-
-    if decision == "BLOCK" and trust < 20:
-
-        duration = threat_db.get_ban_duration(ip)
-
-        telemetry.log("BLOCKED_ATTACKER", ip, f"BANNED_{duration}s")
+    if firewall_control.is_protection_enabled():
 
         block_engine.block_ip(ip, duration)
 
-        print(f"🔥 BLOCKED {ip} for {duration} seconds")
+        share_threat(ip, reason)
 
-    elif decision == "SUSPICIOUS":
+        print(f"🔥 BLOCKED {ip}")
 
-        telemetry.log("SUSPICIOUS_ACTIVITY", ip, "MONITOR")
+    else:
 
-        print(f"⚠️ Suspicious behavior from {ip}")
+        print(f"⚠️ DETECTED {ip} (blocking disabled)")
 
-
-# =============================
-# EVENT REGISTRATION
-# =============================
 
 def register_event(ip, event_name, weight):
 
-    trust_engine.decrease(ip, 10)
+    traffic_monitor.record_attack()
+
+    trust_engine.record_attack(ip)
 
     sequence_engine.record_event(ip, event_name)
 
     seq = sequence_engine.detect_sequence(ip)
 
     if seq:
-
-        print(f"[SEQUENCE DETECTED] {' → '.join(seq)}")
-
         risk_engine.add_event(ip, "ATTACK_SEQUENCE", 80)
 
     risk_engine.add_event(ip, event_name, weight)
 
-    respond_to_threat(ip)
+    decision = risk_engine.decision(ip)
 
+    if decision == "BLOCK":
 
-# =============================
-# DETECTION PIPELINE
-# =============================
+        respond_to_threat(ip, event_name)
+
 
 def detection_engine(event):
 
     ip = event.source_ip
     packet = event.raw_packet
 
-    # -------------------------
-    # traffic monitor
-    # -------------------------
+    traffic_monitor.record_packet(ip)
 
-    traffic_monitor.record_packet()
+    if collab_intel.is_known_bad(ip):
 
-    # -------------------------
-    # protocol analysis
-    # -------------------------
-
-    proto = protocol_analyzer.analyze(packet)
-
-    print(f"[PROTO] {ip} → {proto['protocol']}:{proto['port']}")
-
-    # -------------------------
-    # baseline behavior
-    # -------------------------
-
-    baseline_state = baseline_engine.update(ip)
-
-    if baseline_state == "ANOMALOUS":
-
-        print(f"[BASELINE] abnormal traffic from {ip}")
-
-        register_event(ip, "BASELINE_ANOMALY", 30)
-
-    elif baseline_state == "ELEVATED":
-
-        register_event(ip, "BASELINE_ELEVATED", 10)
-
-    # -------------------------
-    # known attacker check
-    # -------------------------
-
-    if threat_memory.is_known_attacker(ip):
-
-        print(f"⚠️ Known attacker detected: {ip}")
-
-        telemetry.log("KNOWN_ATTACKER", ip, "AUTO_BLOCK")
-
-        block_engine.block_ip(ip, 600)
-
+        respond_to_threat(ip, "THREAT_FEED")
         return
 
-    # -------------------------
-    # TCP stealth scan
-    # -------------------------
+    if trust_engine.is_untrusted(ip):
+
+        respond_to_threat(ip, "LOW_TRUST")
+        return
+
+    intel = threat_intel.lookup(ip)
+
+    if intel.get("malicious"):
+
+        respond_to_threat(ip, "THREAT_INTEL")
+        return
 
     anomaly = tcp_analyzer.analyze(packet)
 
     if anomaly:
 
-        telemetry.log(anomaly, ip, "DETECTED")
-
-        threat_memory.record_attack(ip, anomaly)
-
         register_event(ip, anomaly, 50)
-
         return
-
-    # -------------------------
-    # port scan detection
-    # -------------------------
 
     if scan_detector.analyze(event):
 
-        telemetry.log("PORT_SCAN", ip, "DETECTED")
-
-        threat_memory.record_attack(ip, "PORT_SCAN")
-
         register_event(ip, "PORT_SCAN", 40)
-
         return
-
-    # -------------------------
-    # payload attack detection
-    # -------------------------
 
     if payload_inspector.inspect(event.payload):
 
-        telemetry.log("PAYLOAD_ATTACK", ip, "DETECTED")
-
-        threat_memory.record_attack(ip, "PAYLOAD_ATTACK")
-
         register_event(ip, "PAYLOAD_ATTACK", 60)
-
         return
 
-    # -------------------------
-    # ML detection
-    # -------------------------
-
-    features = feature_extractor.update(packet)
+    features = flow_analyzer.update(packet)
 
     if not features:
+
+        trust_engine.record_benign(ip)
         return
 
     result = ml_detector.analyze(features)
 
-    probability = result["attack_probability"]
-
     if result["is_attack"]:
 
-        print("\n🤖 AI DETECTED ATTACK")
-
-        print("Probability:", probability)
-
-        if "reason" in result:
-
-            print("Reason:")
-
-            for k, v in result["reason"].items():
-                print(f"{k} → {v}")
-
-        telemetry.log("ML_ATTACK_DETECTED", ip, probability)
-
-        threat_memory.record_attack(ip, "ML_ATTACK")
-
-        register_event(ip, "ML_ATTACK", int(probability * 100))
-
+        register_event(ip, "ML_ATTACK", 80)
         return
 
-    # -------------------------
-    # normal traffic
-    # -------------------------
+    trust_engine.record_benign(ip)
 
-    trust_engine.increase(ip, 1)
-
-    print(f"[SAFE] {ip} → {event.destination_ip}")
-
-
-# =============================
-# START PACKET CAPTURE
-# =============================
 
 start_sniffer(detection_engine)
