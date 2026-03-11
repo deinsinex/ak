@@ -11,5 +11,6 @@ datasets/
 federation/global_model.json
 federation/local_model.json
 federation/local_model_version.txt
+federation/threat_feed.json
 
 intel/threat_reputation.json

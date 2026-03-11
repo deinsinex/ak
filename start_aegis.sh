@@ -1,70 +1,46 @@
 #!/bin/bash
 
-echo ""
-echo "======================================"
-echo "     AEGIS AI SECURITY PLATFORM"
-echo "======================================"
-echo ""
+# ======================================
+# AEGIS AI FIREWALL SOC LAB LAUNCHER
+# ======================================
 
-echo "Starting Federation Server..."
+PROJECT_ROOT="/home/akshay/edge_ml"
+PYTHON_BIN="/home/akshay/federated_env/bin/python"
 
-gnome-terminal -- bash -c "cd federation; python server.py; exec bash"
+FED_SERVER_MODULE="federation.server"
+THREAT_INTEL_MODULE="federation.threat_intel_server"
 
-sleep 2
-
-echo "Starting Threat Intel Server..."
-
-gnome-terminal -- bash -c "cd federation; python threat_intel_server.py; exec bash"
-
-sleep 2
-
-echo "Starting AI Firewall..."
-
-gnome-terminal -- bash -c "cd ..; sudo /home/akshay/federated_env/bin/python main.py; exec bash"
-
-sleep 2
-
-echo "Starting Firewall Dashboard..."
-
-gnome-terminal -- bash -c "cd visualization; python dashboard_server.py; exec bash"
-
-sleep 2
-
-echo "Starting Attack Globe..."
-
-gnome-terminal -- bash -c "cd visualization; python soc_globe.py; exec bash"
-
-sleep 2
-
-echo "Starting Attack Lab..."
-
-gnome-terminal -- bash -c "cd visualization; python attack_simulator.py; exec bash"
-
-sleep 2
-
-echo "Starting SOC Wall..."
-
-gnome-terminal -- bash -c "cd visualization; python soc_wall.py; exec bash"
-
-sleep 2
-
-echo "Starting Control Center..."
-
-gnome-terminal -- bash -c "cd visualization; python control_center.py; exec bash"
+MAIN_APP="$PROJECT_ROOT/main.py"
+SOC_GLOBE="$PROJECT_ROOT/visualization/soc_globe.py"
+ATTACK_SIM="$PROJECT_ROOT/visualization/attack_simulator.py"
+SOC_WALL="$PROJECT_ROOT/visualization/soc_wall.py"
+CONTROL_CENTER="$PROJECT_ROOT/visualization/control_center.py"
+VULN_SERVER="$PROJECT_ROOT/lab/vulnerable_server.py"
 
 echo ""
 echo "======================================"
-echo " PLATFORM READY"
-echo ""
-echo "Control Center:"
-echo "http://localhost:7600"
-echo ""
-echo "SOC Wall:"
-echo "http://localhost:7500"
-echo ""
-echo "Attack Lab:"
-echo "http://localhost:7300"
-echo ""
-echo "Attack Globe:"
-echo "http://localhost:7100"
+echo "     AEGIS AI FIREWALL SOC LAB"
 echo "======================================"
+echo ""
+
+# -----------------------------
+# PRECHECKS
+# -----------------------------
+
+if ! command -v gnome-terminal >/dev/null 2>&1; then
+    echo "❌ gnome-terminal is not installed."
+    echo "Install it with:"
+    echo "sudo apt update && sudo apt install gnome-terminal -y"
+    exit 1
+fi
+
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "❌ Python interpreter not found:"
+    echo "$PYTHON_BIN"
+    exit 1
+fi
+
+if [ ! -d "$PROJECT_ROOT" ]; then
+    echo "❌ Project root not found:"
+    echo "$PROJECT_ROOT"
+    exit 1
