@@ -2,6 +2,10 @@ import xgboost as xgb
 import pandas as pd
 import numpy as np
 import os
+import json
+
+
+MODEL_METADATA_FILE = "training/model_metadata.json"
 
 
 class EdgeNode:
@@ -11,7 +15,22 @@ class EdgeNode:
         self.node_id = node_id
         self.dataset_path = dataset_path
         self.model = None
+        self.feature_names = self._load_feature_names()
 
+    def _load_feature_names(self):
+
+        if not os.path.exists(MODEL_METADATA_FILE):
+            raise FileNotFoundError(f"Missing model metadata: {MODEL_METADATA_FILE}")
+
+        with open(MODEL_METADATA_FILE, "r") as f:
+            data = json.load(f)
+
+        feature_names = data.get("feature_names")
+
+        if not feature_names or not isinstance(feature_names, list):
+            raise ValueError("Invalid model_metadata.json: missing feature_names")
+
+        return feature_names
 
     def load_data(self):
 
@@ -22,23 +41,37 @@ class EdgeNode:
 
         df = pd.read_csv(self.dataset_path)
 
-        # Convert labels
+        # -----------------------------
+        # Build target from label1
+        # -----------------------------
         if "label1" not in df.columns:
             raise ValueError("Dataset must contain 'label1' column")
 
         df["target"] = df["label1"].apply(
-            lambda x: 1 if str(x).lower() == "attack" else 0
-        )
+            lambda x: 1 if str(x).strip().lower() == "attack" else 0
+        ).astype(int)
 
-        df = df.select_dtypes(include=[np.number])
+        # -----------------------------
+        # Strict 51-feature alignment
+        # -----------------------------
+        aligned = pd.DataFrame()
 
-        if "target" not in df.columns:
-            raise ValueError("Target column missing after preprocessing")
+        for feature in self.feature_names:
+
+            if feature in df.columns:
+                aligned[feature] = pd.to_numeric(df[feature], errors="coerce").fillna(0.0)
+            else:
+                aligned[feature] = 0.0
 
         y = df["target"]
-        X = df.drop(columns=["target"])
 
-        return X, y
+        if aligned.empty:
+            raise ValueError("Aligned feature matrix is empty")
+
+        print(f"[{self.node_id}] Exact metadata features used: {len(self.feature_names)}")
+        print(f"[{self.node_id}] Samples loaded: {len(aligned)}")
+
+        return aligned, y
 
 
     def train_local_model(self):
@@ -73,8 +106,7 @@ class EdgeNode:
 
         weights = {}
 
-        for i, value in enumerate(importances):
-
-            weights[f"feature_{i}"] = float(value)
+        for feature_name, value in zip(self.feature_names, importances):
+            weights[feature_name] = float(value)
 
         return weights

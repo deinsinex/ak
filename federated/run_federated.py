@@ -1,18 +1,22 @@
 from federated.edge_node import EdgeNode
-from federated.aggregator import FederatedAggregator
+from federation.client import send_weights
 
 
-print("\nStarting Federated Learning Simulation\n")
+print("\nStarting REAL Federated Learning Simulation\n")
 
 
-# Simulate three factories with local datasets
+# =============================
+# REAL EDGE NODES
+# =============================
 
 node1 = EdgeNode("factory_A", "datasets/node_A_data.csv")
 node2 = EdgeNode("factory_B", "datasets/node_B_data.csv")
 node3 = EdgeNode("factory_C", "datasets/node_C_data.csv")
 
 
-# Train local models
+# =============================
+# TRAIN LOCAL MODELS
+# =============================
 
 print("\nTraining local models...\n")
 
@@ -21,22 +25,32 @@ node2.train_local_model()
 node3.train_local_model()
 
 
-# Export model weights
+# =============================
+# EXPORT LOCAL WEIGHTS
+# =============================
 
-print("\nExporting weights...\n")
+print("\nExporting local model weights...\n")
 
 w1 = node1.export_weights()
 w2 = node2.export_weights()
 w3 = node3.export_weights()
 
 
-# Federated aggregation
+# =============================
+# SEND TO REAL SECURE SERVER
+# =============================
 
-aggregator = FederatedAggregator()
+print("\nSending secure federated updates to server...\n")
 
-global_model = aggregator.aggregate([w1, w2, w3])
+print("[factory_A] Sending weights...")
+send_weights(w1)
+
+print("[factory_B] Sending weights...")
+send_weights(w2)
+
+print("[factory_C] Sending weights...")
+send_weights(w3)
 
 
-print("\nFederated Global Model Created:\n")
-
-print(global_model)
+print("\nREAL Federated Learning Simulation Complete\n")
+print("Check: https://127.0.0.1:8000/global_model\n")

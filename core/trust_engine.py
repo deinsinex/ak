@@ -1,10 +1,9 @@
-import time
 import os
 import json
-import ipaddress
+import time
 
 
-TRUST_FILE = "core/trusted_networks.json"
+STATE_FILE = "core/trust_state.json"
 
 
 class TrustEngine:
@@ -12,226 +11,280 @@ class TrustEngine:
     def __init__(self):
         self.trust_scores = {}
         self.last_seen = {}
-
         self.MAX_TRUST = 100
         self.MIN_TRUST = 0
+        self.DEFAULT_TRUST = 50
 
-        self.trusted_ips = set()
-        self.trusted_subnets = []
+        self.RECOVERY_INTERVAL = 120      # seconds
+        self.RECOVERY_POINTS = 2          # trust points recovered per interval
+        self.STALE_RESET_AFTER = 3600     # 1 hour
 
-        self._load_or_initialize_trust_config()
-
-    # ==========================================
-    # TRUST SCORE SYSTEM
-    # ==========================================
-
-    def get_trust(self, ip):
-        return self.trust_scores.get(ip, 50)
-
-    def record_benign(self, ip):
-        score = self.trust_scores.get(ip, 50)
-
-        score += 1
-        if score > self.MAX_TRUST:
-            score = self.MAX_TRUST
-
-        self.trust_scores[ip] = score
-        self.last_seen[ip] = time.time()
-
-    def record_suspicious(self, ip):
-        score = self.trust_scores.get(ip, 50)
-
-        score -= 10
-        if score < self.MIN_TRUST:
-            score = self.MIN_TRUST
-
-        self.trust_scores[ip] = score
-        self.last_seen[ip] = time.time()
-
-    def record_attack(self, ip):
-        score = self.trust_scores.get(ip, 50)
-
-        score -= 30
-        if score < self.MIN_TRUST:
-            score = self.MIN_TRUST
-
-        self.trust_scores[ip] = score
-        self.last_seen[ip] = time.time()
-
-    def is_untrusted(self, ip):
-        score = self.get_trust(ip)
-        return score < 20
-
-    def observe(self, ip):
-        """
-        Safe lightweight runtime observation.
-        Keeps timestamps updated without changing trust score.
-        """
-        self.last_seen[ip] = time.time()
+        self._load_state()
 
     # ==========================================
-    # ALLOWLIST / TRUSTED NETWORK SYSTEM
+    # PERSISTENCE
     # ==========================================
 
-    def _default_config(self):
-        """
-        IMPORTANT:
-        Do NOT trust the entire 10.200.0.0/16 subnet because
-        attacker namespaces use 10.200.x.2 in the real lab.
-        Only trust infrastructure IPs explicitly.
-        """
-        return {
-            "trusted_ips": [
-                "127.0.0.1",
-                "::1",
-                "10.200.1.1",
-                "10.200.2.1",
-                "10.200.3.1"
-            ],
-            "trusted_subnets": [
-                "127.0.0.0/8"
-            ]
-        }
-
-    def _load_or_initialize_trust_config(self):
+    def _load_state(self):
         try:
-            if not os.path.exists(TRUST_FILE):
-                self._save_config(self._default_config())
+            if not os.path.exists(STATE_FILE):
+                return
 
-            with open(TRUST_FILE, "r") as f:
+            if os.path.getsize(STATE_FILE) == 0:
+                return
+
+            with open(STATE_FILE, "r") as f:
                 data = json.load(f)
 
-            trusted_ips = data.get("trusted_ips", [])
-            trusted_subnets = data.get("trusted_subnets", [])
+            if not isinstance(data, dict):
+                return
 
-            self.trusted_ips = set()
-            self.trusted_subnets = []
+            self.trust_scores = data.get("trust_scores", {})
+            self.last_seen = data.get("last_seen", {})
 
-            for ip in trusted_ips:
-                try:
-                    ipaddress.ip_address(ip)
-                    self.trusted_ips.add(ip)
-                except Exception:
-                    print(f"[TRUST] Invalid trusted IP ignored: {ip}")
+            # normalize values
+            self.trust_scores = {
+                str(ip): int(score)
+                for ip, score in self.trust_scores.items()
+            }
 
-            for cidr in trusted_subnets:
-                try:
-                    net = ipaddress.ip_network(cidr, strict=False)
-                    self.trusted_subnets.append(net)
-                except Exception:
-                    print(f"[TRUST] Invalid trusted subnet ignored: {cidr}")
+            self.last_seen = {
+                str(ip): float(ts)
+                for ip, ts in self.last_seen.items()
+            }
 
-            print(f"[TRUST] Loaded {len(self.trusted_ips)} trusted IPs and {len(self.trusted_subnets)} trusted subnets")
+            print(f"[TRUST] Loaded {len(self.trust_scores)} trust entries")
 
         except Exception as e:
-            print(f"[TRUST] Failed to load trust config: {e}")
-            self.trusted_ips = set(self._default_config()["trusted_ips"])
-            self.trusted_subnets = [
-                ipaddress.ip_network(c, strict=False)
-                for c in self._default_config()["trusted_subnets"]
-            ]
+            print(f"[TRUST] Failed to load state: {e}")
+            self.trust_scores = {}
+            self.last_seen = {}
 
-    def _save_current_config(self):
-        data = {
-            "trusted_ips": sorted(list(self.trusted_ips)),
-            "trusted_subnets": [str(n) for n in self.trusted_subnets]
-        }
-        self._save_config(data)
-
-    def _save_config(self, data):
+    def _save_state(self):
         try:
             os.makedirs("core", exist_ok=True)
 
-            with open(TRUST_FILE, "w") as f:
+            data = {
+                "trust_scores": self.trust_scores,
+                "last_seen": self.last_seen
+            }
+
+            with open(STATE_FILE, "w") as f:
                 json.dump(data, f, indent=4)
 
         except Exception as e:
-            print(f"[TRUST] Failed to save trust config: {e}")
+            print(f"[TRUST] Failed to save state: {e}")
 
-    def is_trusted(self, ip):
-        if not ip:
-            return False
+    # ==========================================
+    # INTERNAL HELPERS
+    # ==========================================
 
-        if ip in self.trusted_ips:
-            return True
+    def _clamp(self, score):
+        if score > self.MAX_TRUST:
+            return self.MAX_TRUST
+        if score < self.MIN_TRUST:
+            return self.MIN_TRUST
+        return score
+
+    def _touch(self, ip):
+        self.last_seen[ip] = time.time()
+
+    def _ensure_ip(self, ip):
+        if ip not in self.trust_scores:
+            self.trust_scores[ip] = self.DEFAULT_TRUST
+        if ip not in self.last_seen:
+            self.last_seen[ip] = time.time()
+
+    # ==========================================
+    # TRUST QUERIES
+    # ==========================================
+
+    def get_trust(self, ip):
+        self._ensure_ip(ip)
+        self._apply_decay_for_ip(ip)
+        return self.trust_scores.get(ip, self.DEFAULT_TRUST)
+
+    def get_state(self, ip):
+        score = self.get_trust(ip)
+
+        if score >= 80:
+            return "TRUSTED"
+        elif score >= 50:
+            return "NORMAL"
+        elif score >= 20:
+            return "SUSPICIOUS"
+        else:
+            return "UNTRUSTED"
+
+    def is_untrusted(self, ip):
+        return self.get_trust(ip) < 20
+
+    def is_suspicious(self, ip):
+        return self.get_trust(ip) < 50
+
+    # ==========================================
+    # TRUST EVENTS
+    # ==========================================
+
+    def record_benign(self, ip, points=1):
+        self._ensure_ip(ip)
+        self._apply_decay_for_ip(ip)
+
+        score = self.trust_scores[ip]
+        score += points
+
+        self.trust_scores[ip] = self._clamp(score)
+        self._touch(ip)
+        self._save_state()
+
+    def record_suspicious(self, ip, points=10):
+        self._ensure_ip(ip)
+        self._apply_decay_for_ip(ip)
+
+        score = self.trust_scores[ip]
+        score -= points
+
+        self.trust_scores[ip] = self._clamp(score)
+        self._touch(ip)
+        self._save_state()
+
+    def record_attack(self, ip, points=30):
+        self._ensure_ip(ip)
+        self._apply_decay_for_ip(ip)
+
+        score = self.trust_scores[ip]
+        score -= points
+
+        self.trust_scores[ip] = self._clamp(score)
+        self._touch(ip)
+        self._save_state()
+
+    def reward_trust(self, ip, points=5):
+        self._ensure_ip(ip)
+        self._apply_decay_for_ip(ip)
+
+        self.trust_scores[ip] = self._clamp(self.trust_scores[ip] + points)
+        self._touch(ip)
+        self._save_state()
+
+    def penalize(self, ip, points=15):
+        self._ensure_ip(ip)
+        self._apply_decay_for_ip(ip)
+
+        self.trust_scores[ip] = self._clamp(self.trust_scores[ip] - points)
+        self._touch(ip)
+        self._save_state()
+
+    # ==========================================
+    # DECAY / AGING LOGIC
+    # ==========================================
+
+    def _apply_decay_for_ip(self, ip):
+        """
+        Slowly recover trust over time for inactive hosts.
+        If an IP is stale for a very long time, gradually move toward default trust.
+        """
+        if ip not in self.last_seen:
+            return
+
+        now = time.time()
+        last = self.last_seen[ip]
+        elapsed = now - last
+
+        # gradual recovery if enough time passed
+        if elapsed >= self.RECOVERY_INTERVAL:
+            intervals = int(elapsed // self.RECOVERY_INTERVAL)
+            recovery = intervals * self.RECOVERY_POINTS
+
+            current = self.trust_scores.get(ip, self.DEFAULT_TRUST)
+
+            # recover upward toward DEFAULT_TRUST if below it
+            if current < self.DEFAULT_TRUST:
+                current = min(self.DEFAULT_TRUST, current + recovery)
+
+            # or slightly recover upward if already above default but cap at MAX_TRUST
+            elif current < self.MAX_TRUST:
+                current = min(self.MAX_TRUST, current + max(1, intervals // 2))
+
+            self.trust_scores[ip] = self._clamp(current)
+
+            # move forward the timestamp anchor to avoid double-counting same elapsed time
+            self.last_seen[ip] = now
+            self._save_state()
+
+        # if very stale and entry somehow missing score, normalize
+        if elapsed >= self.STALE_RESET_AFTER and ip not in self.trust_scores:
+            self.trust_scores[ip] = self.DEFAULT_TRUST
+            self._save_state()
+
+    def apply_decay_all(self):
+        for ip in list(self.trust_scores.keys()):
+            self._apply_decay_for_ip(ip)
+
+    # ==========================================
+    # MAINTENANCE
+    # ==========================================
+
+    def reset(self):
+        self.trust_scores = {}
+        self.last_seen = {}
 
         try:
-            addr = ipaddress.ip_address(ip)
-        except Exception:
-            return False
-
-        for subnet in self.trusted_subnets:
-            if addr in subnet:
-                return True
-
-        return False
-
-    def add_trusted_ip(self, ip):
-        try:
-            ipaddress.ip_address(ip)
-            self.trusted_ips.add(ip)
-            self._save_current_config()
-            print(f"[TRUST] Added trusted IP: {ip}")
-            return True
+            if os.path.exists(STATE_FILE):
+                os.remove(STATE_FILE)
         except Exception as e:
-            print(f"[TRUST] Failed to add trusted IP {ip}: {e}")
-            return False
+            print(f"[TRUST] Failed to remove state file: {e}")
 
-    def remove_trusted_ip(self, ip):
-        if ip in self.trusted_ips:
-            self.trusted_ips.remove(ip)
-            self._save_current_config()
-            print(f"[TRUST] Removed trusted IP: {ip}")
-            return True
+        print("[TRUST] Trust memory reset")
 
-        print(f"[TRUST] Trusted IP not found: {ip}")
-        return False
+    def remove_ip(self, ip):
+        if ip in self.trust_scores:
+            del self.trust_scores[ip]
 
-    def add_trusted_subnet(self, cidr):
-        try:
-            net = ipaddress.ip_network(cidr, strict=False)
+        if ip in self.last_seen:
+            del self.last_seen[ip]
 
-            if all(str(existing) != str(net) for existing in self.trusted_subnets):
-                self.trusted_subnets.append(net)
-                self._save_current_config()
-                print(f"[TRUST] Added trusted subnet: {cidr}")
+        self._save_state()
 
-            return True
+    def get_all(self):
+        self.apply_decay_all()
 
-        except Exception as e:
-            print(f"[TRUST] Failed to add trusted subnet {cidr}: {e}")
-            return False
+        result = {}
 
-    def remove_trusted_subnet(self, cidr):
-        removed = False
+        for ip, score in self.trust_scores.items():
+            result[ip] = {
+                "score": score,
+                "state": self.get_state(ip),
+                "last_seen": self.last_seen.get(ip)
+            }
 
-        try:
-            target = str(ipaddress.ip_network(cidr, strict=False))
+        return result
 
-            new_subnets = []
+    def summary(self):
+        self.apply_decay_all()
 
-            for net in self.trusted_subnets:
-                if str(net) == target:
-                    removed = True
-                else:
-                    new_subnets.append(net)
+        total = len(self.trust_scores)
+        trusted = 0
+        normal = 0
+        suspicious = 0
+        untrusted = 0
 
-            self.trusted_subnets = new_subnets
+        for ip in self.trust_scores:
+            state = self.get_state(ip)
 
-            if removed:
-                self._save_current_config()
-                print(f"[TRUST] Removed trusted subnet: {cidr}")
+            if state == "TRUSTED":
+                trusted += 1
+            elif state == "NORMAL":
+                normal += 1
+            elif state == "SUSPICIOUS":
+                suspicious += 1
             else:
-                print(f"[TRUST] Trusted subnet not found: {cidr}")
+                untrusted += 1
 
-            return removed
-
-        except Exception as e:
-            print(f"[TRUST] Failed to remove trusted subnet {cidr}: {e}")
-            return False
-
-    def list_trusted(self):
         return {
-            "trusted_ips": sorted(list(self.trusted_ips)),
-            "trusted_subnets": [str(n) for n in self.trusted_subnets]
+            "total_hosts": total,
+            "trusted": trusted,
+            "normal": normal,
+            "suspicious": suspicious,
+            "untrusted": untrusted
         }

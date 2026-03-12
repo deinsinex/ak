@@ -13,4 +13,7 @@ federation/local_model.json
 federation/local_model_version.txt
 federation/threat_feed.json
 
+core/trust_state.json
+core/firewall_state.json
+
 intel/threat_reputation.json

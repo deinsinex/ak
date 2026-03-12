@@ -1,0 +1,13 @@
+{
+    "exact_ips": [
+        "127.0.0.1",
+        "::1"
+    ],
+    "cidr_ranges": [
+        "127.0.0.0/8"
+    ],
+    "notes": [
+        "Add only infrastructure IPs you NEVER want blocked.",
+        "Do NOT add attacker lab subnets here if you want real multi-IP blocking."
+    ]
+}

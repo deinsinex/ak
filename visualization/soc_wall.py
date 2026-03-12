@@ -57,7 +57,7 @@ margin-top:0;
 
 <div class="panel">
 <h2>🌍 Global Attack Map</h2>
-<iframe src="http://localhost:7100"></iframe>
+<iframe src="http://localhost:7000"></iframe>
 </div>
 
 <div class="panel">
