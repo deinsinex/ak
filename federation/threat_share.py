@@ -3,13 +3,13 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-THREAT_FEED_URL = "http://127.0.0.1:8200/share"
+THREAT_FEED_URL = "https://127.0.0.1:8100/report_threat"
 
 
 def share_threat_event(ip, event_name):
     """
-    Share a threat event to collaborative intel server.
-    Safe no-op if server is unavailable.
+    Share a detected threat event to the collaborative threat intel server.
+    Safe no-op if the server is unavailable.
     """
     payload = {
         "ip": ip,
@@ -20,6 +20,7 @@ def share_threat_event(ip, event_name):
         response = requests.post(
             THREAT_FEED_URL,
             json=payload,
+            verify=False,
             timeout=3
         )
 

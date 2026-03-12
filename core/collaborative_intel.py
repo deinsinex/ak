@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import ipaddress
 
 
 THREAT_FEED_FILE = "federation/threat_feed.json"
@@ -15,72 +16,90 @@ class CollaborativeIntel:
         self.last_mtime = 0
         self.refresh()
 
-    def _safe_load_json(self, path):
+    def _is_valid_remote_ip(self, ip):
         """
-        Safely load JSON file.
-        Returns {} if file missing / empty / invalid.
+        Keep only public routable IPs in shared intel.
+        Avoid poisoning with local/private/loopback/etc.
         """
         try:
-            if not os.path.exists(path):
-                return {}
+            addr = ipaddress.ip_address(ip)
+            return not (
+                addr.is_private or
+                addr.is_loopback or
+                addr.is_link_local or
+                addr.is_multicast or
+                addr.is_reserved or
+                addr.is_unspecified
+            )
+        except Exception:
+            return False
 
-            if os.path.getsize(path) == 0:
-                return {}
-
-            with open(path, "r") as f:
-                data = json.load(f)
-
-            if isinstance(data, dict):
-                return data
-
-            return {}
-
-        except Exception as e:
-            print(f"[COLLAB INTEL] Failed to load {path}: {e}")
-            return {}
-
-    def _normalize_feed(self, raw_data):
+    def _safe_load_json(self):
         """
-        Normalize multiple possible threat feed formats into:
+        Safely load the threat feed JSON file.
+        Expected normalized format:
         {
             "ip": {
                 "score": int,
                 "reason": str,
                 "source": str,
-                "timestamp": float
+                "timestamp": float,
+                "count": int
             }
         }
         """
+        try:
+            if not os.path.exists(self.feed_file):
+                return {}
 
-        normalized = {}
+            if os.path.getsize(self.feed_file) == 0:
+                return {}
 
-        # Case 1:
-        # {
-        #   "1.2.3.4": {"score": 80, "reason": "PORT_SCAN"}
-        # }
-        if all(isinstance(v, dict) for v in raw_data.values()) if raw_data else True:
-            for ip, info in raw_data.items():
+            with open(self.feed_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not isinstance(data, dict):
+                return {}
+
+            normalized = {}
+            now = time.time()
+
+            for ip, info in data.items():
                 if not isinstance(ip, str):
                     continue
 
+                if not self._is_valid_remote_ip(ip):
+                    continue
+
                 if not isinstance(info, dict):
-                    info = {}
+                    continue
+
+                score = int(info.get("score", 50))
+                score = max(0, min(score, 100))  # clamp 0..100
+
+                timestamp = float(info.get("timestamp", now))
+
+                # Expire very old intel automatically (24 hours)
+                if (now - timestamp) > 86400:
+                    continue
 
                 normalized[ip] = {
-                    "score": int(info.get("score", 50)),
+                    "score": score,
                     "reason": str(info.get("reason", "SHARED_THREAT")),
-                    "source": str(info.get("source", "federation")),
-                    "timestamp": float(info.get("timestamp", time.time()))
+                    "source": str(info.get("source", "shared_intel")),
+                    "timestamp": timestamp,
+                    "count": int(info.get("count", 1))
                 }
 
             return normalized
 
-        # Fallback
-        return {}
+        except Exception as e:
+            print(f"[COLLAB INTEL] Failed to load {self.feed_file}: {e}")
+            return {}
 
     def refresh(self):
         """
-        Reload feed if changed.
+        Reload the threat feed if the file changed.
         """
         try:
             if not os.path.exists(self.feed_file):
@@ -94,9 +113,7 @@ class CollaborativeIntel:
             if current_mtime == self.last_mtime and self.shared_threats:
                 return
 
-            raw = self._safe_load_json(self.feed_file)
-            self.shared_threats = self._normalize_feed(raw)
-
+            self.shared_threats = self._safe_load_json()
             self.last_loaded = time.time()
             self.last_mtime = current_mtime
 
@@ -132,7 +149,7 @@ class CollaborativeIntel:
         if ip not in self.shared_threats:
             return None
 
-        return self.shared_threats[ip].get("source", "federation")
+        return self.shared_threats[ip].get("source", "shared_intel")
 
     def get_shared_timestamp(self, ip):
         self.refresh()
@@ -141,6 +158,14 @@ class CollaborativeIntel:
             return None
 
         return self.shared_threats[ip].get("timestamp")
+
+    def get_shared_count(self, ip):
+        self.refresh()
+
+        if ip not in self.shared_threats:
+            return 0
+
+        return int(self.shared_threats[ip].get("count", 1))
 
     def get_threat_info(self, ip):
         self.refresh()
@@ -161,7 +186,7 @@ class CollaborativeIntel:
     def clear_cache(self):
         """
         Clears only in-memory cache.
-        Does not delete file.
+        Does not delete the underlying file.
         """
         self.shared_threats = {}
         self.last_loaded = 0

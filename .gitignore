@@ -1,19 +1,43 @@
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+
+# Model artifacts
 *.pkl
 
+# Large / generated data
 logs/
 datasets/
 *.tar.xz
 
+# TLS certs (self-signed local only)
 *.pem
 
+# Runtime-generated federation files
 federation/global_model.json
 federation/local_model.json
 federation/local_model_version.txt
 federation/threat_feed.json
 
+# Runtime-generated core/intel state
 core/trust_state.json
 core/firewall_state.json
-
 intel/threat_reputation.json
+
+# Runtime PID files
+*.pid
+.aegis_main.pid
+.attack_simulator.pid
+.federation_server.pid
+.soc_wall.pid
+.threat_intel_server.pid
+.vuln_server.pid
+
+# Runtime logs
+*.log
+
+# Local virtual environments / editor temp
+.venv/
+venv/
+*.swp

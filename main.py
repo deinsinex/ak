@@ -31,9 +31,7 @@ from visualization.control_api import start_control_api, register_runtime
 
 import threading
 import time
-
-
-print("\n🛡️ Aegis AI Firewall Starting...\n")
+import ipaddress
 
 
 # =========================================================
@@ -61,6 +59,162 @@ threat_intel_engine = None
 collaborative_intel = None
 allowlist_engine = None
 
+# Event dedup / cooldown memory
+event_cooldowns = {}
+
+# Per-IP last-seen timestamps for very light traffic heuristics
+ip_last_seen = {}
+
+# Cooldown windows (seconds)
+EVENT_COOLDOWN_SECONDS = {
+    "BASELINE_ANOMALY": 180,       # calmer than before
+    "COLLAB_THREAT_FEED": 600,     # much calmer
+    "PORT_SCAN": 90,
+    "PAYLOAD_ATTACK": 60,
+    "ML_ATTACK": 180,              # calmer
+    "ATTACK_SEQUENCE": 180,
+    "SYN_SCAN": 90,
+    "XMAS_SCAN": 90,
+    "NULL_SCAN": 90,
+    "KNOWN_ATTACKER": 300,
+}
+
+
+# =========================================================
+# SAFE / SHARE FILTER HELPERS
+# =========================================================
+
+def is_private_or_local_ip(ip):
+    """
+    True for private, loopback, link-local, reserved, multicast, unspecified.
+    These should never be shared into collaborative threat intel
+    and should not be treated as remote malicious reputation.
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+        return (
+            addr.is_private or
+            addr.is_loopback or
+            addr.is_link_local or
+            addr.is_multicast or
+            addr.is_reserved or
+            addr.is_unspecified
+        )
+    except Exception:
+        return True
+
+
+def is_safe_common_service_port(port):
+    """
+    Common client/server ports that frequently appear in normal browsing / updates.
+    """
+    return port in {53, 80, 443, 123}
+
+
+def is_likely_benign_service(ip, port):
+    """
+    Conservative false-positive reducer:
+    If traffic is going to common web/DNS/NTP ports, do NOT treat collaborative
+    intel alone as enough to escalate hard.
+    """
+    if is_private_or_local_ip(ip):
+        return True
+
+    if allowlist_engine and allowlist_engine.is_allowlisted(ip):
+        return True
+
+    if is_safe_common_service_port(port):
+        return True
+
+    return False
+
+
+def should_share_event(ip, event_name, weight):
+    """
+    Only share high-confidence remote attacker events.
+    Prevent poisoning / self-feedback loops.
+    """
+    if is_private_or_local_ip(ip):
+        return False
+
+    if allowlist_engine and allowlist_engine.is_allowlisted(ip):
+        return False
+
+    if event_name == "COLLAB_THREAT_FEED":
+        return False
+
+    # Only share stronger signals
+    if weight < 40:
+        return False
+
+    # Do not share weak baseline-only anomalies
+    if event_name == "BASELINE_ANOMALY":
+        return False
+
+    return True
+
+
+def should_process_event(ip, event_name):
+    """
+    Per-IP per-event cooldown to prevent score inflation and noisy repeated detections.
+    """
+    now = time.time()
+    key = f"{ip}:{event_name}"
+    cooldown = EVENT_COOLDOWN_SECONDS.get(event_name, 60)
+
+    last_seen = event_cooldowns.get(key)
+    if last_seen is not None and (now - last_seen) < cooldown:
+        return False
+
+    event_cooldowns[key] = now
+    return True
+
+
+def cleanup_event_cooldowns():
+    """
+    Periodically remove stale cooldown entries.
+    """
+    now = time.time()
+    stale_keys = []
+
+    for key, ts in list(event_cooldowns.items()):
+        if (now - ts) > 1800:  # 30 min cleanup horizon
+            stale_keys.append(key)
+
+    for key in stale_keys:
+        event_cooldowns.pop(key, None)
+
+
+def cleanup_ip_last_seen():
+    """
+    Prevent unbounded growth of simple timing memory.
+    """
+    now = time.time()
+    stale_ips = []
+
+    for ip, ts in list(ip_last_seen.items()):
+        if (now - ts) > 1800:
+            stale_ips.append(ip)
+
+    for ip in stale_ips:
+        ip_last_seen.pop(ip, None)
+
+
+def is_rapid_repeat(ip, threshold_seconds=1.0):
+    """
+    Very light heuristic:
+    returns True if this IP is appearing repeatedly very quickly.
+    Useful to avoid flagging one-off normal connections as baseline anomalies.
+    """
+    now = time.time()
+    last = ip_last_seen.get(ip)
+    ip_last_seen[ip] = now
+
+    if last is None:
+        return False
+
+    return (now - last) <= threshold_seconds
+
 
 # =========================================================
 # INITIALIZE / RESET RUNTIME ENGINES
@@ -87,6 +241,8 @@ def initialize_engines():
     global threat_intel_engine
     global collaborative_intel
     global allowlist_engine
+    global event_cooldowns
+    global ip_last_seen
 
     payload_inspector = PayloadInspector()
     scan_detector = ScanDetector()
@@ -108,6 +264,9 @@ def initialize_engines():
     threat_intel_engine = ThreatIntelEngine()
     collaborative_intel = CollaborativeIntel()
     allowlist_engine = AllowlistEngine()
+
+    event_cooldowns = {}
+    ip_last_seen = {}
 
     print("✅ All Aegis engines initialized")
 
@@ -132,13 +291,25 @@ def get_runtime_status():
     except Exception:
         allowlist = {}
 
+    try:
+        shared_threats = collaborative_intel.count() if collaborative_intel else 0
+    except Exception:
+        shared_threats = 0
+
+    try:
+        traffic_stats = traffic_monitor.stats() if traffic_monitor else {}
+    except Exception:
+        traffic_stats = {}
+
     return {
         "status": "ok",
         "mode": mode,
         "protection_enabled": firewall_control.is_protection_enabled() if firewall_control else False,
         "active_block_count": len(active_blocks),
         "active_blocks": active_blocks,
-        "allowlist": allowlist
+        "allowlist": allowlist,
+        "shared_threat_count": shared_threats,
+        "traffic": traffic_stats
     }
 
 
@@ -162,31 +333,27 @@ def register_control_runtime():
 
 def reset_firewall_runtime():
     """
-    Clears persistent files + removes current Aegis blocks +
-    recreates runtime engine objects + re-registers control API.
+    Clears persistent files + recreates runtime engine objects.
+    Also removes current iptables blocks.
     """
     global block_engine
 
     print("\n🧹 FULL FIREWALL RESET STARTED")
 
-    # Remove active firewall blocks first
     try:
         if block_engine is not None:
             block_engine.unblock_all()
     except Exception as e:
         print(f"[RESET] Failed to unblock all before reset: {e}")
 
-    # Clear persistent files
     try:
         if firewall_control is not None:
             firewall_control.reset_memory_files()
     except Exception as e:
         print(f"[RESET] Failed to clear persistent files: {e}")
 
-    # Recreate all runtime objects (this resets trust/risk/sequence/etc in memory)
     initialize_engines()
 
-    # Re-register updated runtime objects into control API
     try:
         register_control_runtime()
     except Exception as e:
@@ -196,22 +363,7 @@ def reset_firewall_runtime():
 
 
 # =========================================================
-# START DASHBOARD + CONTROL API
-# =========================================================
-
-threading.Thread(
-    target=start_attack_dashboard,
-    daemon=True
-).start()
-
-threading.Thread(
-    target=start_control_api,
-    daemon=True
-).start()
-
-
-# =========================================================
-# FEDERATED MODEL UPDATER (PULL ONLY)
+# BACKGROUND LOOPS
 # =========================================================
 
 def model_update_loop():
@@ -226,10 +378,6 @@ def model_update_loop():
         time.sleep(300)
 
 
-# =========================================================
-# COLLABORATIVE THREAT FEED LOOP
-# =========================================================
-
 def collaborative_intel_loop():
     while True:
         try:
@@ -240,8 +388,19 @@ def collaborative_intel_loop():
         time.sleep(60)
 
 
+def cooldown_cleanup_loop():
+    while True:
+        try:
+            cleanup_event_cooldowns()
+            cleanup_ip_last_seen()
+        except Exception as e:
+            print(f"[COOLDOWN] Cleanup error: {e}")
+
+        time.sleep(120)
+
+
 # =========================================================
-# RESPONSE ENGINE (SINGLE ENFORCEMENT PATH)
+# RESPONSE ENGINE
 # =========================================================
 
 def respond_to_threat(ip):
@@ -249,28 +408,31 @@ def respond_to_threat(ip):
 
     if decision == "BLOCK":
 
-        # Detect-only mode: log but do not enforce
         if not firewall_control.is_protection_enabled():
             telemetry.log("BLOCK_SKIPPED_DETECT_MODE", ip, "DETECT_ONLY")
             print(f"🟡 DETECT MODE: would block {ip}, but protection is disabled")
             return
 
-        # Never block allowlisted IPs
         if allowlist_engine.is_allowlisted(ip):
             telemetry.log("ALLOWLISTED_BLOCK_SKIPPED", ip, "ALLOWLISTED")
             print(f"🟢 Allowlisted IP not blocked: {ip}")
+            return
+
+        if is_private_or_local_ip(ip):
+            telemetry.log("LOCAL_IP_BLOCK_SKIPPED", ip, "LOCAL_INFRA")
+            print(f"🔵 Local/private IP not blocked: {ip}")
             return
 
         duration = threat_db.get_ban_duration(ip)
 
         telemetry.log("BLOCKED_ATTACKER", ip, f"BANNED_{duration}s")
 
-        success = block_engine.block_ip(ip, duration)
+        applied = block_engine.block_ip(ip, duration)
 
-        if success:
+        if applied:
             print(f"🔥 BLOCKED {ip} for {duration} seconds")
         else:
-            print(f"⚠️ Block attempted but not confirmed for {ip}")
+            print(f"⚠️ Block attempt failed or already active for {ip}")
 
     elif decision == "SUSPICIOUS":
         telemetry.log("SUSPICIOUS_ACTIVITY", ip, "MONITOR")
@@ -282,37 +444,42 @@ def respond_to_threat(ip):
 # =========================================================
 
 def register_event(ip, event_name, weight):
-    # Trust degradation
+    if not should_process_event(ip, event_name):
+        print(f"[COOLDOWN] Skipping repeated {event_name} for {ip}")
+        return
+
+    try:
+        traffic_monitor.record_attack()
+    except Exception as e:
+        print(f"[TRAFFIC MONITOR] Failed to record attack: {e}")
+
     if weight >= 60:
         trust_engine.record_attack(ip)
     else:
         trust_engine.record_suspicious(ip)
 
-    # Sequence memory
     sequence_engine.record_event(ip, event_name)
 
     seq = sequence_engine.detect_sequence(ip)
-
     if seq:
-        print(f"[SEQUENCE DETECTED] {' → '.join(seq)}")
-        risk_engine.add_event(ip, "ATTACK_SEQUENCE", 80)
+        if should_process_event(ip, "ATTACK_SEQUENCE"):
+            print(f"[SEQUENCE DETECTED] {' → '.join(seq)}")
+            risk_engine.add_event(ip, "ATTACK_SEQUENCE", 80)
 
-    # Threat intelligence (local)
     try:
         threat_intel_engine.record_event(ip, event_name)
     except Exception as e:
         print(f"[THREAT INTEL] Local record failed: {e}")
 
-    # Threat intelligence (shared)
     try:
-        share_threat_event(ip, event_name)
+        if should_share_event(ip, event_name, weight):
+            share_threat_event(ip, event_name)
+        else:
+            print(f"[THREAT SHARE] Skipped sharing {event_name} for {ip}")
     except Exception as e:
         print(f"[THREAT SHARE] Failed to share event: {e}")
 
-    # Risk engine
     risk_engine.add_event(ip, event_name, weight)
-
-    # Final response
     respond_to_threat(ip)
 
 
@@ -324,62 +491,73 @@ def detection_engine(event):
     ip = event.source_ip
     packet = event.raw_packet
 
-    # -----------------------------------------------------
-    # Allowlist bypass (safe + visible in telemetry)
-    # -----------------------------------------------------
     if allowlist_engine.is_allowlisted(ip):
-        telemetry.log("ALLOWLIST_BYPASS", ip, "ALLOWLISTED")
+        return
+
+    proto = protocol_analyzer.analyze(packet)
+    dst_port = proto.get("port")
+    print(f"[PROTO] {ip} → {proto['protocol']}:{dst_port}")
+
+    try:
+        traffic_monitor.record_packet(ip)
+    except Exception as e:
+        print(f"[TRAFFIC MONITOR] Failed to record packet: {e}")
+
+    # Keep local/private visible, but do not score/enforce
+    if is_private_or_local_ip(ip):
         return
 
     # -----------------------------------------------------
-    # Protocol analysis
-    # -----------------------------------------------------
-    proto = protocol_analyzer.analyze(packet)
-    print(f"[PROTO] {ip} → {proto['protocol']}:{proto['port']}")
-
-    # -----------------------------------------------------
-    # Traffic monitor
-    # -----------------------------------------------------
-    traffic_monitor.observe(ip)
-
-    # -----------------------------------------------------
-    # Baseline analysis
+    # BASELINE (calmer)
+    # Only score baseline anomaly if it repeats quickly AND
+    # it is not just routine web/DNS/NTP traffic
     # -----------------------------------------------------
     baseline_state = baseline_engine.update(ip)
 
     if baseline_state == "ANOMALOUS":
-        print(f"[BASELINE] abnormal traffic from {ip}")
-        register_event(ip, "BASELINE_ANOMALY", 30)
+        if is_rapid_repeat(ip, threshold_seconds=1.0) and not is_safe_common_service_port(dst_port):
+            print(f"[BASELINE] abnormal traffic from {ip}")
+            register_event(ip, "BASELINE_ANOMALY", 15)
+        else:
+            # Visible for debugging, but no risk inflation
+            print(f"[BASELINE] benign-ish anomaly ignored for {ip}")
 
     # -----------------------------------------------------
-    # Known attacker (must go through unified response path)
+    # KNOWN ATTACKER
     # -----------------------------------------------------
     if threat_memory.is_known_attacker(ip):
-        print(f"⚠️ Known attacker detected: {ip}")
+        if should_process_event(ip, "KNOWN_ATTACKER"):
+            print(f"⚠️ Known attacker detected: {ip}")
+            telemetry.log("KNOWN_ATTACKER", ip, "AUTO_BLOCK")
 
-        telemetry.log("KNOWN_ATTACKER", ip, "HIGH_RISK")
-
-        # Use unified policy path instead of direct block
-        risk_engine.add_event(ip, "KNOWN_ATTACKER", 90)
-        respond_to_threat(ip)
+            if firewall_control.is_protection_enabled() and not allowlist_engine.is_allowlisted(ip):
+                block_engine.block_ip(ip, 600)
+            else:
+                print(f"🟡 DETECT MODE or allowlisted: known attacker not blocked ({ip})")
         return
 
     # -----------------------------------------------------
-    # Collaborative intel reputation
+    # COLLABORATIVE INTEL (much safer)
+    # Do NOT aggressively escalate for common web service ports
     # -----------------------------------------------------
     try:
         rep = collaborative_intel.get_shared_score(ip)
 
         if rep >= 50:
-            print(f"[COLLAB INTEL] Known bad reputation for {ip}: {rep}")
-            register_event(ip, "COLLAB_THREAT_FEED", 70)
-            return
+            reason = collaborative_intel.get_shared_reason(ip) or "SHARED_THREAT"
+
+            if is_likely_benign_service(ip, dst_port):
+                print(f"[COLLAB INTEL] Reputation noted but softened for {ip}: {rep} ({reason})")
+            else:
+                print(f"[COLLAB INTEL] Known bad reputation for {ip}: {rep} ({reason})")
+                register_event(ip, "COLLAB_THREAT_FEED", 35)
+                return
 
     except Exception as e:
         print(f"[COLLAB INTEL] Reputation lookup failed: {e}")
 
     # -----------------------------------------------------
-    # TCP stealth scan
+    # TCP FLAG / SIGNATURE SCANS
     # -----------------------------------------------------
     anomaly = tcp_analyzer.analyze(packet)
 
@@ -390,16 +568,20 @@ def detection_engine(event):
         return
 
     # -----------------------------------------------------
-    # Port scan
+    # PORT SCAN DETECTOR
+    # Existing detector kept, but don't overreact to common ports
     # -----------------------------------------------------
     if scan_detector.analyze(event):
-        telemetry.log("PORT_SCAN", ip, "DETECTED")
-        threat_memory.record_attack(ip, "PORT_SCAN")
-        register_event(ip, "PORT_SCAN", 40)
-        return
+        if is_safe_common_service_port(dst_port):
+            print(f"[SCAN] Common service-port scan-like pattern softened for {ip}")
+        else:
+            telemetry.log("PORT_SCAN", ip, "DETECTED")
+            threat_memory.record_attack(ip, "PORT_SCAN")
+            register_event(ip, "PORT_SCAN", 40)
+            return
 
     # -----------------------------------------------------
-    # Payload attack
+    # PAYLOAD ATTACK
     # -----------------------------------------------------
     if payload_inspector.inspect(event.payload):
         telemetry.log("PAYLOAD_ATTACK", ip, "DETECTED")
@@ -408,7 +590,7 @@ def detection_engine(event):
         return
 
     # -----------------------------------------------------
-    # Flow analysis → ML features
+    # FLOW FEATURES + ML
     # -----------------------------------------------------
     features = flow_analyzer.update(packet)
 
@@ -416,26 +598,23 @@ def detection_engine(event):
         trust_engine.record_benign(ip)
         return
 
-    # -----------------------------------------------------
-    # ML detection
-    # -----------------------------------------------------
     result = ml_detector.analyze(features)
     probability = result["attack_probability"]
 
-    if result["is_attack"]:
-        print("\n🤖 AI DETECTED ATTACK")
-        print("Probability:", probability)
+    # Make ML less aggressive:
+    # require both model attack AND high confidence
+    if result["is_attack"] and probability >= 0.92:
+        if should_process_event(ip, "ML_ATTACK"):
+            print("\n🤖 AI DETECTED ATTACK")
+            print("Probability:", probability)
 
-        telemetry.log("ML_ATTACK_DETECTED", ip, probability)
-
-        threat_memory.record_attack(ip, "ML_ATTACK")
-
-        register_event(ip, "ML_ATTACK", int(probability * 100))
+            telemetry.log("ML_ATTACK_DETECTED", ip, probability)
+            threat_memory.record_attack(ip, "ML_ATTACK")
+            register_event(ip, "ML_ATTACK", 35)
+        else:
+            print(f"[COOLDOWN] Skipping repeated ML_ATTACK for {ip}")
         return
 
-    # -----------------------------------------------------
-    # Benign outcome
-    # -----------------------------------------------------
     trust_engine.record_benign(ip)
     print(f"[SAFE] {ip} → {event.destination_ip}")
 
@@ -445,29 +624,20 @@ def detection_engine(event):
 # =========================================================
 
 if __name__ == "__main__":
-    initialize_engines()
+    print("\n🛡️ Aegis AI Firewall Starting...\n")
 
-    # Register control API runtime after objects exist
+    threading.Thread(target=start_attack_dashboard, daemon=True).start()
+    threading.Thread(target=start_control_api, daemon=True).start()
+
+    initialize_engines()
     register_control_runtime()
 
-    threading.Thread(
-        target=model_update_loop,
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=collaborative_intel_loop,
-        daemon=True
-    ).start()
-
-    # NOTE:
-    # Real federated training is currently run manually via:
-    #   python -m federated.run_federated
-    # We intentionally do NOT auto-push background weights from main.py
-    # until a true online local trainer is implemented.
+    threading.Thread(target=model_update_loop, daemon=True).start()
+    threading.Thread(target=collaborative_intel_loop, daemon=True).start()
+    threading.Thread(target=cooldown_cleanup_loop, daemon=True).start()
 
     print(f"🟡 Firewall mode: {firewall_control.get_mode().upper()}")
     print(f"🟢 Allowlist summary: {allowlist_engine.summary()}")
+    print(f"🧠 Shared threat count: {collaborative_intel.count()}")
 
-    # Start packet capture
     start_sniffer(detection_engine)
